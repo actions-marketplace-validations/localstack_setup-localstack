@@ -1,0 +1,125 @@
+name: Create PR Preview
+
+inputs:
+  github-token:
+    description: 'Github token used to create PR comments'
+    required: true
+  localstack-api-key:
+    description: 'LocalStack API key used to create the preview environment'
+    required: false
+  preview-cmd:
+    description: 'Command(s) used to create a preview of the PR (can use $AWS_ENDPOINT_URL)'
+    required: false
+    default: ''
+  auto-load-pod:
+    description: 'The pod to load on startup of LocalStack, the env var AUTO_LOAD_POD'
+    required: false
+    default: ''
+  extension-auto-install:
+    description: 'The extension(s) to automatically install on startup of LocalStack, the env var EXTENSION_AUTO_INSTALL'
+    required: false
+    default: ''
+  lifetime:
+    description: 'The lifetime of the ephemeral instance, how long the instance should be available for'
+    required: false
+    default: '30'
+  
+
+runs:
+  using: composite
+  steps:
+    - run: >
+        echo "GH_ACTION_ROOT=$(
+          ls -d $(
+            ls -d ./../../_actions/* |
+            grep -i localstack |
+            tail -n1
+          )/setup-localstack/* | 
+          grep -v completed | 
+          tail -n1
+        )" >> $GITHUB_ENV
+      shell: bash
+
+    - name: Initial PR comment
+      if: inputs.github-token
+      uses: jenseng/dynamic-uses@v1
+      with:
+        uses: ${{ env.GH_ACTION_ROOT }}/prepare
+        with: |-
+          {
+            "github-token": ${{ toJSON(inputs.github-token) }}
+          }
+
+    - name: Download PR artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: pr-id
+
+    - name: Setup preview name
+      shell: bash
+      run: |
+        prId=$(<pr-id.txt)
+        repoName=$GITHUB_REPOSITORY
+        repoNameCleaned=$(echo -n "$repoName" | tr -c '[:alnum:]' '-')
+        previewName=preview-$repoNameCleaned-$prId
+        echo "previewName=$previewName" >> $GITHUB_ENV
+
+    - name: Create preview environment
+      shell: bash
+      id: create-instance
+      run: |
+        autoLoadPod="${AUTO_LOAD_POD:-${{ inputs.auto-load-pod }}}"
+        extensionAutoInstall="${EXTENSION_AUTO_INSTALL:-${{ inputs.extension-auto-install }}}"
+        lifetime="${{ inputs.lifetime }}"
+
+        list_response=$(curl -X GET \
+            -H "ls-api-key: ${LOCALSTACK_AUTH_TOKEN:-${LOCALSTACK_API_KEY:-${{ inputs.localstack-api-key }}}}" \
+            -H "content-type: application/json" \
+            https://api.localstack.cloud/v1/compute/instances)
+
+        instance_exists=$(echo "$list_response" | jq --arg NAME "$previewName" '.[] | select(.instance_name == $NAME)')
+
+        if [ -n "$instance_exists" ]; then
+          del_response=$(curl -X DELETE \
+            -H "ls-api-key: ${LOCALSTACK_AUTH_TOKEN:-${LOCALSTACK_API_KEY:-${{ inputs.localstack-api-key }}}}" \
+            -H "content-type: application/json" \
+            https://api.localstack.cloud/v1/compute/instances/$previewName)
+        fi
+
+        response=$(curl -X POST -d "{\"instance_name\": \"${previewName}\", \"lifetime\": ${lifetime} ,\"env_vars\": {\"AUTO_LOAD_POD\": \"${autoLoadPod}\", \"EXTENSION_AUTO_INSTALL\": \"${extensionAutoInstall}\"}}"\
+            -H "ls-api-key: ${LOCALSTACK_AUTH_TOKEN:-${LOCALSTACK_API_KEY:-${{ inputs.localstack-api-key }}}}" \
+            -H "content-type: application/json" \
+            https://api.localstack.cloud/v1/compute/instances)
+        endpointUrl=$(echo "$response" | jq -r .endpoint_url)
+        if [ "$endpointUrl" = "null" ] || [ "$endpointUrl" = "" ]; then
+          echo "Unable to create preview environment. API response: $response"
+          exit 1
+        fi
+        echo "Created preview environment with endpoint URL: $endpointUrl"
+
+        echo $endpointUrl > ./ls-preview-url.txt
+        echo "LS_PREVIEW_URL=$endpointUrl" >> $GITHUB_ENV
+        echo "AWS_ENDPOINT_URL=$endpointUrl" >> $GITHUB_ENV
+
+    - name: Upload preview instance URL
+      uses: actions/upload-artifact@v4
+      with:
+        name: preview-instance-url
+        path: ./ls-preview-url.txt
+
+    - name: Run preview deployment
+      if: ${{ inputs.preview-cmd != '' }}
+      shell: bash
+      run:
+        ${{ inputs.preview-cmd }}
+
+    - name: Print logs of ephemeral instance
+      if: ${{ !cancelled() && steps.create-instance.outcome == 'success' }}
+      shell: bash
+      run: |
+        log_response=$(curl -X GET \
+            -H "ls-api-key: ${LOCALSTACK_AUTH_TOKEN:-${LOCALSTACK_API_KEY:-${{ inputs.localstack-api-key }}}}" \
+            -H "content-type: application/json" \
+            https://api.localstack.cloud/v1/compute/instances/$previewName/logs)
+        
+        echo "$log_response" | jq -r '.[].content'
